@@ -104,11 +104,14 @@ def update_antibody_levels(G):
         G.nodes[node]['antibody_level_2'] = max(0.0, 
             G.nodes[node]['antibody_level_2'] - G.nodes[node]['antibody_waning'])
 
-def get_protection_factor(antibody_level):
+def get_protection_factor(antibody_level, l = 0.9, a =3, b = -10, scaled_logit = False):
     """Calculate protection factor based on antibody level (0-1 scale where 1 = complete protection)."""
-    return antibody_level
+    if scaled_logit:
+        return (l / (1 + np.exp(a + b * antibody_level)))
+    else:
+        return antibody_level
 
-def simulate_outbreaks(G, steps, plot=True, print_progress=True):
+def simulate_outbreaks(G, steps, plot=True, print_progress=True, scaled_logit = False):
     """Simulates disease outbreaks in the graph over a number of steps."""
     
     # Initialize tracking arrays
@@ -142,7 +145,7 @@ def simulate_outbreaks(G, steps, plot=True, print_progress=True):
                 for neighbor in G.neighbors(node):
                     if G.nodes[neighbor]['S1']:
                         # Apply antibody protection
-                        protection_1 = get_protection_factor(G.nodes[neighbor]['antibody_level_1'])
+                        protection_1 = get_protection_factor(G.nodes[neighbor]['antibody_level_1'], scaled_logit = scaled_logit)
                         effective_prob_1 = G.nodes[neighbor]['infection_prob_1'] * (1 - protection_1)
                         
                         if random.random() < effective_prob_1:
@@ -168,7 +171,7 @@ def simulate_outbreaks(G, steps, plot=True, print_progress=True):
                 for neighbor in G.neighbors(node):
                     if G.nodes[neighbor]['S2']:
                         # Apply antibody protection
-                        protection_2 = get_protection_factor(G.nodes[neighbor]['antibody_level_2'])
+                        protection_2 = get_protection_factor(G.nodes[neighbor]['antibody_level_2'], scaled_logit = scaled_logit)
                         effective_prob_2 = G.nodes[neighbor]['infection_prob_2'] * (1 - protection_2)
                         
                         if random.random() < effective_prob_2:
@@ -291,13 +294,16 @@ def estimate_models(G, print_results=True):
     data = pd.DataFrame.from_dict(dict(G.nodes(data=True)), orient='index')
 
     # Define antibody level grid for predictions
-    antibody_grid = np.linspace(0, 1, 10)  # 10 points from 0 to 1
+    antibody_grid = np.linspace(.1, .9, 9)  # 10 points from 0 to 1
+    antibody_grid = np.concatenate((.01, antibody_grid, .99), axis = None)
     
     # Initialize results dictionary
     results = {
         'antibody_grid': antibody_grid,
-        'protection_test_negative_design': None,
-        'hr_vaccination_tnd': None
+        'protection_spline': None,
+        'hr_vaccination_tnd': None,
+        'protection_log': None,
+        'antibody_distribution': None
     }
     
     try:
@@ -311,8 +317,20 @@ def estimate_models(G, print_results=True):
             # Use antibody level 2 at test for test-negative design (the target pathogen)
             tnd_df = tnd_data[['test_positive', 'antibody_level_2_at_test', 'X']].copy()
             tnd_df = tnd_df.dropna()
-            
+            bin_edges = (antibody_grid[:-1] + antibody_grid[1:]) / 2
+            bin_edges = np.concatenate(([0.0], bin_edges, [1.0]))
+            #print(bin_edges) 
+
+            hist_counts, _ = np.histogram(tnd_df['antibody_level_2_at_test'], bins=bin_edges)
+            #print(tnd_df) 
+            results['antibody_distribution'] = hist_counts
+            #print(results['antibody_distribution'])
+            #print(hist_counts)
+
+
             if len(tnd_df) > 20 and tnd_df['antibody_level_2_at_test'].var() > 0:
+
+                #Spline transformation
                 try:
                     # Create spline basis for TND
                     spline_transformer_tnd = SplineTransformer(n_knots=3, degree=3, include_bias=False)
@@ -339,12 +357,41 @@ def estimate_models(G, print_results=True):
                     
                     # Protection = 1 - OR
                     protection_tnd = 1 - or_grid
-                    results['protection_test_negative_design'] = protection_tnd
+                    results['protection_spline'] = protection_tnd
                     
                 except Exception as e:
                     if print_results:
                         print(f"TND spline fitting failed: {e}")
         
+
+                # Log-transformed antibody model (without spline transformation)
+                try:
+                    tnd_df2 = tnd_df.copy()
+                    tnd_df2['log_antibody'] = np.log(1 - tnd_df2['antibody_level_2_at_test'])
+
+                    if tnd_df2['log_antibody'].var() > 0:
+                        X_log = np.column_stack([tnd_df2[['X']].values, tnd_df2[['log_antibody']].values])
+
+                        log_model = LogisticRegression(penalty=None, max_iter=1000)
+                        log_model.fit(X_log, tnd_df2['test_positive'])
+
+                        # Predict at grid points
+                        log_grid = np.log(1 - antibody_grid)
+                        X_grid_log = np.column_stack([np.full(len(log_grid), 0.5), log_grid.reshape(-1, 1)])
+
+                        #Predicted probabilities
+                        prob_log = log_model.predict_proba(X_grid_log)[:, 1]
+
+                        odds_log = prob_log / (1 - prob_log)
+                        or_log = odds_log / odds_log[0]
+                        protection_log = 1 - or_log
+
+                        results['protection_log'] = protection_log
+
+                except Exception as e:
+                    if print_results:
+                        print(f"Log antibody model failed: {e}")
+
         # Also calculate traditional vaccination-based TND for comparison
         try:
             tnd_vacc = tnd_data[['test_positive', 'vaccinated', 'X']].copy()
@@ -356,7 +403,9 @@ def estimate_models(G, print_results=True):
         except Exception as e:
             if print_results:
                 print(f"Vaccination-based TND model fitting failed: {e}")
-    
+
+  
+
     except Exception as e:
         if print_results:
             print(f"Model fitting failed: {e}")
@@ -366,25 +415,31 @@ def estimate_models(G, print_results=True):
         print("=== TEST-NEGATIVE DESIGN ANALYSIS (antibody levels at time of testing) ===")
         print(f"Antibody levels: {antibody_grid}")
         
-        if results['protection_test_negative_design'] is not None:
-            print(f"Antibody-based Protection: {results['protection_test_negative_design']}")
+        print("=== SPLINE ===")
+        if results['protection_spline'] is not None:
+            print(f"Antibody-based Protection: {results['protection_spline']}")
         else:
             print("Antibody-based Protection: Could not estimate (insufficient data)")
         
+        print("=== LOG-TRANSFORMED ===")
+        if results['protection_log'] is not None:
+            print(f"Antibody-based Protection: {results['protection_log']}")
+        else:
+            print("Antibody-based Protection: Could not estimate (insufficient data)")
+
         print("\n=== VACCINATION-BASED TND (for comparison) ===")
         if results['hr_vaccination_tnd'] is not None:
             print(f"Vaccination TND HR: {results['hr_vaccination_tnd']:.3f}")
             print(f"Vaccination TND VE: {(1 - results['hr_vaccination_tnd']) * 100:.1f}%")
         else:
             print("Vaccination TND: Could not estimate (insufficient data)")
-    
     return results
 
 def run_simulation(num_nodes=1000, edges_per_node=5, infection_prob=(0.02, 0.02), 
                   recovery_prob=(0.1, 0.1), testing_prob=(0.3, 0.3), vaccine_prob=0.5,
                   num_initial_infected=(5, 5), steps=100,
                   antibody_max_vacc=0.8, antibody_max_inf=0.9, antibody_waning=0.01,
-                  plot=True, print_progress=True):
+                  plot=True, print_progress=True, scaled_logit = False):
     """
     Convenience function to run a complete test-negative design simulation.
     
@@ -416,7 +471,7 @@ def run_simulation(num_nodes=1000, edges_per_node=5, infection_prob=(0.02, 0.02)
     assign_vaccine(G)
     
     # Run simulation
-    G, time_series_data = simulate_outbreaks(G, steps, plot=plot, print_progress=print_progress)
+    G, time_series_data = simulate_outbreaks(G, steps, plot=plot, print_progress=print_progress, scaled_logit = scaled_logit)
     
     # Estimate models
     model_results = estimate_models(G, print_results=print_progress)
@@ -427,8 +482,48 @@ def run_simulation(num_nodes=1000, edges_per_node=5, infection_prob=(0.02, 0.02)
         'time_series': time_series_data,
         # Extract key results for backward compatibility
         'hr_test_negative_design': model_results.get('hr_vaccination_tnd'),
-        'protection_test_negative_design': model_results.get('protection_test_negative_design'),
-        'antibody_grid': model_results.get('antibody_grid')
+        'protection_spline': model_results.get('protection_spline'),
+        'protection_log': model_results.get('protection_log'),
+        'antibody_grid': model_results.get('antibody_grid'),
+        'antibody_distribution': model_results.get('antibody_distribution')
     }
     
     return G, results
+
+def compute_bias_mse(predictions, true, dist):
+    diffs = predictions - true[np.newaxis, :]
+    bias_vec = np.nanmean(diffs, axis=0) #average for all sims
+    mse_vec = np.nanmean(diffs**2, axis=0) #average for all sims
+
+    avg_dist = np.nanmean(dist, axis=0)
+
+    se_bias = np.nanstd(diffs, axis=0, ddof=1) 
+    se_mse = np.nanstd(diffs**2, axis=0, ddof=1)
+
+    sim_bias = np.nanmean(diffs, axis=1)  #average for all grid points
+    sim_mse = np.nanmean(diffs**2, axis=1) #average for all grid points
+
+    bias_overall = np.nanmean(sim_bias) #avergae over all grid points/all sims
+    mse_overall = np.nanmean(sim_mse)  #avergae over all grid points/all sims
+    se_bias_overall = np.nanstd(sim_bias, ddof=1) / np.sqrt(np.sum(~np.isnan(sim_bias)))
+    se_mse_overall = np.nanstd(sim_mse, ddof=1) / np.sqrt(np.sum(~np.isnan(sim_mse)))
+
+    weighted_bias = np.average(bias_vec, weights=avg_dist)
+    weighted_mse = np.average(mse_vec, weights=avg_dist)
+    print(avg_dist)
+
+    return {
+        'bias_vec': bias_vec,
+        'mse_vec': mse_vec,
+        'se_bias': se_bias,
+        'se_mse': se_mse,
+        'bias_overall': bias_overall,
+        'mse_overall': mse_overall,
+        'se_bias_overall': se_bias_overall,
+        'se_mse_overall': se_mse_overall,
+        'weighted_bias': weighted_bias, 
+        'weighted_mse': weighted_mse
+    }
+
+def scaled_logit(x, l, a, b):
+    return (l / (1 + np.exp(a + b * x)))
